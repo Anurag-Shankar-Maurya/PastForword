@@ -2,8 +2,8 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
 */
-import { GoogleGenAI } from "@google/genai";
 import type { GenerateContentResponse } from "@google/genai";
+// Note: We no longer need GoogleGenAI for the API call itself, but we'll keep the type import.
 
 const API_KEY = process.env.API_KEY;
 
@@ -11,7 +11,7 @@ if (!API_KEY) {
   throw new Error("API_KEY environment variable is not set");
 }
 
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+// We no longer need to instantiate the client: const ai = new GoogleGenAI({ apiKey: API_KEY });
 
 
 // --- Helper Functions ---
@@ -47,14 +47,16 @@ function processGeminiResponse(response: GenerateContentResponse): string {
         const { mimeType, data } = imagePartFromResponse.inlineData;
         return `data:${mimeType};base64,${data}`;
     }
-
-    const textResponse = response.text;
-    console.error("API did not return an image. Response:", textResponse);
-    throw new Error(`The AI model responded with text instead of an image: "${textResponse || 'No text response received.'}"`);
+    
+    // The raw response might have text in a different place if an error occurs.
+    const textResponse = JSON.stringify(response);
+    console.error("API did not return an image. Full Response:", textResponse);
+    throw new Error(`The AI model responded with text or an error instead of an image: "${textResponse}"`);
 }
 
 /**
  * A wrapper for the Gemini API call that includes a retry mechanism for internal server errors.
+ * This version uses a direct `fetch` call to bypass SDK limitations.
  * @param imagePart The image part of the request payload.
  * @param textPart The text part of the request payload.
  * @returns The GenerateContentResponse from the API.
@@ -62,17 +64,50 @@ function processGeminiResponse(response: GenerateContentResponse): string {
 async function callGeminiWithRetry(imagePart: object, textPart: object): Promise<GenerateContentResponse> {
     const maxRetries = 3;
     const initialDelay = 1000;
+    const model = 'gemini-2.0-flash-preview-image-generation';
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${API_KEY}`;
+
+    const body = {
+        contents: [{
+            parts: [imagePart, textPart],
+        }],
+        generationConfig: {
+            // This is the crucial part that the SDK was not handling correctly for this model.
+            responseModalities: ["IMAGE", "TEXT"],
+        },
+    };
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            return await ai.models.generateContent({
-                model: 'gemini-2.5-flash-image-preview',
-                contents: { parts: [imagePart, textPart] },
+            const response = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(body),
             });
+
+            if (!response.ok) {
+                // Handle non-200 responses
+                const errorData = await response.json();
+                const errorMessage = JSON.stringify(errorData);
+                throw new Error(`API request failed with status ${response.status}: ${errorMessage}`);
+            }
+
+            const responseData = await response.json();
+            
+            // Check if the response contains candidates, if not, it's an implicit error
+            if (!responseData.candidates || responseData.candidates.length === 0) {
+                 throw new Error(`API returned an empty or invalid response: ${JSON.stringify(responseData)}`);
+            }
+            
+            return responseData as GenerateContentResponse;
+
         } catch (error) {
             console.error(`Error calling Gemini API (Attempt ${attempt}/${maxRetries}):`, error);
             const errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
-            const isInternalError = errorMessage.includes('"code":500') || errorMessage.includes('INTERNAL');
+            // Adjusted error check for fetch responses
+            const isInternalError = errorMessage.includes('500') || errorMessage.includes('INTERNAL') || errorMessage.includes('server error');
 
             if (isInternalError && attempt < maxRetries) {
                 const delay = initialDelay * Math.pow(2, attempt - 1);
@@ -114,7 +149,7 @@ export async function generateDecadeImage(imageDataUrl: string, prompt: string):
         return processGeminiResponse(response);
     } catch (error) {
         const errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
-        const isNoImageError = errorMessage.includes("The AI model responded with text instead of an image");
+        const isNoImageError = errorMessage.includes("The AI model responded with text or an error instead of an image");
 
         if (isNoImageError) {
             console.warn("Original prompt was likely blocked. Trying a fallback prompt.");
